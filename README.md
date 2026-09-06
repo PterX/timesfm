@@ -245,8 +245,9 @@ Benchmarks (330M model, Apple M4 Max, context 512, horizon 64, fp32 with `mx.com
 |    32 |     48.1 ms |  666 series/s |
 
 Contexts longer than `global_context` (15,360) are truncated to their most recent points before
-decode, matching the PyTorch backend. Not yet supported by the MLX backend: `use_symmetric_averaging`,
-`use_znorm`, and non-`"none"` `padding_mode` — use the PyTorch backend for those.
+decode, matching the PyTorch backend. `use_symmetric_averaging` is supported and matched to torch.
+Not yet supported by the MLX backend: `use_znorm` and non-`"none"` `padding_mode` — use the PyTorch
+backend for those.
 
 #### 2. Multivariate Forecasting with Covariates
 

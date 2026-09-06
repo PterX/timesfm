@@ -163,14 +163,10 @@ class TimesFM3Forecaster:
     covariates. A 1D input yields ``forecast`` of shape ``(horizon,)``; a 2D
     input yields ``(num_variates, horizon)``, matching the torch backend.
     """
-    for name, flag in (
-      ("use_symmetric_averaging", use_symmetric_averaging),
-      ("use_znorm", use_znorm),
-    ):
-      if flag:
-        raise NotImplementedError(
-          f"{name}=True is not yet supported by the MLX backend."
-        )
+    if use_znorm:
+      raise NotImplementedError(
+        "use_znorm=True is not yet supported by the MLX backend."
+      )
     if padding_mode != "none":
       raise NotImplementedError(
         f"padding_mode={padding_mode!r} is not yet supported by the MLX backend."
@@ -187,11 +183,39 @@ class TimesFM3Forecaster:
     median_idx = self.config.median_quantile_index
     cap = self.config.max_context_length
 
-    def _shape_output(raw, num_target, was_1d, ctx_2d):
-      # raw: (num_variates, horizon, num_quantiles). Keep only the target rows.
-      tgt = raw[:num_target]
-      if sort_quantiles:
-        tgt = np.sort(tgt, axis=-1)
+    def _decode_np(tgt_2d, po_2d, pf_2d):
+      # One series (2D target + optional 2D covariates) -> (num_variates, h, q).
+      return np.array(
+        self.model.decode(
+          mx.array(tgt_2d)[None],
+          horizon,
+          past_only_covariates=mx.array(po_2d)[None] if po_2d is not None else None,
+          past_future_covariates=mx.array(pf_2d)[None] if pf_2d is not None else None,
+        )
+      )[0]
+
+    def _series_logits(tgt_2d, po_2d, pf_2d):
+      # Final (num_variates, h, q) logits: sorted (if requested), and symmetric-
+      # averaged when asked. Symmetric averaging runs the series and its negation
+      # (and negated covariates), sorts each, then averages the quantile-reversed
+      # negative run: (pos - neg[..., ::-1]) / 2, exactly as the torch backend.
+      if use_symmetric_averaging:
+        pos = _decode_np(tgt_2d, po_2d, pf_2d)
+        neg = _decode_np(
+          -tgt_2d,
+          None if po_2d is None else -po_2d,
+          None if pf_2d is None else -pf_2d,
+        )
+        if sort_quantiles:
+          pos = np.sort(pos, axis=-1)
+          neg = np.sort(neg, axis=-1)
+        return (pos - neg[..., ::-1]) / 2
+      out = _decode_np(tgt_2d, po_2d, pf_2d)
+      return np.sort(out, axis=-1) if sort_quantiles else out
+
+    def _shape(final, num_target, was_1d, ctx_2d):
+      # final: (num_variates, h, q), already sorted / averaged. Keep target rows.
+      tgt = final[:num_target]
       forecast = np.array(tgt[..., median_idx])  # (num_target, horizon)
       quantiles = np.array(tgt) if return_quantiles else None
       if make_positive:
@@ -213,11 +237,11 @@ class TimesFM3Forecaster:
     )
     all_univariate = all(np.ndim(c) == 1 for c in contexts)
 
-    if not has_cov and all_univariate:
-      # Fast path: univariate, no covariates. Group by length so each group runs
-      # through a single batched forward pass. decode() is per-series independent
-      # (running stats, RevIN, detrending are per row), so this is numerically
-      # identical to looping but scales throughput near-linearly.
+    if not has_cov and all_univariate and not use_symmetric_averaging:
+      # Fast path: univariate, no covariates, no symmetric averaging. Group by
+      # length so each group runs through a single batched forward pass. decode()
+      # is per-series independent (running stats, RevIN, detrending are per row),
+      # so this is numerically identical to looping but scales throughput.
       arrs = [np.asarray(c, dtype=np.float32).reshape(-1)[-cap:] for c in contexts]
       groups: dict[int, list[int]] = {}
       for i, a in enumerate(arrs):
@@ -225,13 +249,16 @@ class TimesFM3Forecaster:
       for _length, idxs in groups.items():
         batch = mx.array(np.stack([arrs[i] for i in idxs]))[:, None, :]
         logits = np.array(self.model.decode(batch, horizon))  # (B, 1, h, q)
+        if sort_quantiles:
+          logits = np.sort(logits, axis=-1)
         for bi, i in enumerate(idxs):
-          forecast, quantiles = _shape_output(logits[bi], 1, True, arrs[i][None, :])
+          forecast, quantiles = _shape(logits[bi], 1, True, arrs[i][None, :])
           results[i] = ForecastOutput(
             ts_id=ids[i], forecast=forecast, quantiles=quantiles
           )
     else:
-      # General path: multivariate targets and/or covariates, one series at a time.
+      # General path: multivariate targets, covariates, and/or symmetric
+      # averaging, one series at a time.
       for i, c in enumerate(contexts):
         was_1d = np.ndim(c) == 1
         tgt = np.atleast_2d(np.asarray(c, dtype=np.float32))  # (u, ctx)
@@ -250,15 +277,8 @@ class TimesFM3Forecaster:
             future_len = pf.shape[-1] - ctx_len
             pf = pf[:, -(cap + future_len) :]
           ctx_len = cap
-        logits = np.array(
-          self.model.decode(
-            mx.array(tgt)[None],
-            horizon,
-            past_only_covariates=mx.array(po)[None] if po is not None else None,
-            past_future_covariates=mx.array(pf)[None] if pf is not None else None,
-          )
-        )[0]  # (num_variates, h, q)
-        forecast, quantiles = _shape_output(logits, tgt.shape[0], was_1d, tgt)
+        final = _series_logits(tgt, po, pf)  # (num_variates, h, q)
+        forecast, quantiles = _shape(final, tgt.shape[0], was_1d, tgt)
         results[i] = ForecastOutput(
           ts_id=ids[i], forecast=forecast, quantiles=quantiles
         )

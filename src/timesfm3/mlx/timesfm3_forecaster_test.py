@@ -288,6 +288,34 @@ class TimesFM3MlxCovariateParityTest(unittest.TestCase):
     torch_out = self.torch.predict(ctx, horizon=64, return_quantiles=True)
     self._assert_parity(mlx_out, torch_out)
 
+  def test_parity_symmetric_averaging(self):
+    # Symmetric averaging runs each series and its negation and averages the
+    # (quantile-reversed) results. Must match the torch backend.
+    ctx = np.sin(np.linspace(0, 40, 512)).astype(np.float32)
+    kw = dict(horizon=64, return_quantiles=True, use_symmetric_averaging=True)
+    self._assert_parity(self.mlx.predict(ctx, **kw), self.torch.predict(ctx, **kw))
+
+  def test_parity_symmetric_averaging_with_covariates(self):
+    rng = np.random.RandomState(2)
+    ctx_len, horizon = 256, 32
+    target = np.stack(
+      [np.sin(np.linspace(0, 24, ctx_len)), np.sin(np.linspace(1, 26, ctx_len))]
+    ).astype(np.float32)
+    past_only = (0.5 * rng.randn(1, ctx_len)).astype(np.float32)
+    past_future = np.sin(np.linspace(0, 30, ctx_len + horizon))[None, :].astype(
+      np.float32
+    )
+    kw = dict(
+      horizon=horizon,
+      past_only_covariates=past_only,
+      past_future_covariates=past_future,
+      return_quantiles=True,
+      use_symmetric_averaging=True,
+    )
+    self._assert_parity(
+      self.mlx.predict(target, **kw), self.torch.predict(target, **kw)
+    )
+
 
 if __name__ == "__main__":
   unittest.main()
