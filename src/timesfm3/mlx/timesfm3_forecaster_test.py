@@ -156,6 +156,19 @@ class TimesFM3MlxRealWeightsTest(unittest.TestCase):
     self.assertEqual(np.asarray(out.forecast).shape, (64,))
     self.assertEqual(np.asarray(out.quantiles).shape, (64, 9))
 
+  def test_predict_batch_accepts_2d_ndarray_contexts(self):
+    # A 2D ndarray passed straight to predict_batch is a batch of univariate
+    # rows. `if not contexts` raised "truth value ambiguous" on it; the guard
+    # must be a length check instead (matches the torch backend / #483).
+    forecaster = timesfm3_forecaster.TimesFM3Forecaster.from_pretrained(_CHECKPOINT)
+    contexts = np.stack(
+      [np.sin(np.linspace(0, 40, 512)), np.cos(np.linspace(0, 30, 512))]
+    ).astype(np.float32)  # (2, 512)
+    outs = list(forecaster.predict_batch(contexts, horizon=32, return_quantiles=True))
+    self.assertEqual(len(outs), 2)
+    self.assertEqual(np.asarray(outs[0].forecast).shape, (32,))
+    self.assertEqual(np.asarray(outs[1].quantiles).shape, (32, 9))
+
   def test_global_context_default_matches_torch(self):
     # The MLX backend must expose the same 15,360-step context cap as the torch
     # backend so the two are backend-equivalent for very long contexts.

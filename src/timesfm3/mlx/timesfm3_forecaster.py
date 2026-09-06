@@ -175,7 +175,7 @@ class TimesFM3Forecaster:
       raise NotImplementedError(
         f"padding_mode={padding_mode!r} is not yet supported by the MLX backend."
       )
-    if not contexts:
+    if len(contexts) == 0:
       return
 
     n = len(contexts)
