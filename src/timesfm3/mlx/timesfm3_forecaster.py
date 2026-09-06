@@ -22,12 +22,35 @@ compatible for the univariate (target-only) forecasting path.
 from __future__ import annotations
 
 import dataclasses
+import math
 from typing import Iterator
 
 import mlx.core as mx
 import numpy as np
 
 from . import model as mlx_model_lib
+
+# Below this, a series is treated as constant and z-normalization uses sigma=1
+# (matches the torch backend's _SIGMA_THRESHOLD).
+_SIGMA_THRESHOLD = 1e-7
+
+
+def _znorm_stats(arr: np.ndarray) -> tuple[float, float]:
+  """(mean, std) for z-normalization, ignoring NaNs; matches the torch backend."""
+  mu = float(np.nanmean(arr))
+  sigma = float(np.nanstd(arr))
+  if not np.isfinite(mu):
+    mu = 0.0
+  if not np.isfinite(sigma) or sigma < _SIGMA_THRESHOLD:
+    sigma = 1.0
+  return mu, sigma
+
+
+def _znorm_rows(arr: np.ndarray) -> tuple[np.ndarray, list[tuple[float, float]]]:
+  """Z-normalize each row by its own stats; return the normalized array and stats."""
+  stats = [_znorm_stats(row) for row in arr]
+  out = np.stack([(row - mu) / sigma for row, (mu, sigma) in zip(arr, stats)])
+  return out.astype(np.float32), stats
 
 
 @dataclasses.dataclass
@@ -163,14 +186,8 @@ class TimesFM3Forecaster:
     covariates. A 1D input yields ``forecast`` of shape ``(horizon,)``; a 2D
     input yields ``(num_variates, horizon)``, matching the torch backend.
     """
-    if use_znorm:
-      raise NotImplementedError(
-        "use_znorm=True is not yet supported by the MLX backend."
-      )
-    if padding_mode != "none":
-      raise NotImplementedError(
-        f"padding_mode={padding_mode!r} is not yet supported by the MLX backend."
-      )
+    if padding_mode not in ("none", "edge"):
+      raise ValueError(f"Unknown padding_mode: {padding_mode!r}")
     if len(contexts) == 0:
       return
 
@@ -237,11 +254,18 @@ class TimesFM3Forecaster:
     )
     all_univariate = all(np.ndim(c) == 1 for c in contexts)
 
-    if not has_cov and all_univariate and not use_symmetric_averaging:
-      # Fast path: univariate, no covariates, no symmetric averaging. Group by
-      # length so each group runs through a single batched forward pass. decode()
-      # is per-series independent (running stats, RevIN, detrending are per row),
-      # so this is numerically identical to looping but scales throughput.
+    if (
+      not has_cov
+      and all_univariate
+      and not use_symmetric_averaging
+      and not use_znorm
+      and padding_mode == "none"
+    ):
+      # Fast path: plain univariate, no covariates / symmetric averaging / znorm /
+      # padding. Group by length so each group runs through a single batched
+      # forward pass. decode() is per-series independent (running stats, RevIN,
+      # detrending are per row), so this is numerically identical to looping but
+      # scales throughput.
       arrs = [np.asarray(c, dtype=np.float32).reshape(-1)[-cap:] for c in contexts]
       groups: dict[int, list[int]] = {}
       for i, a in enumerate(arrs):
@@ -257,18 +281,32 @@ class TimesFM3Forecaster:
             ts_id=ids[i], forecast=forecast, quantiles=quantiles
           )
     else:
-      # General path: multivariate targets, covariates, and/or symmetric
-      # averaging, one series at a time.
+      # General path: multivariate targets, covariates, symmetric averaging,
+      # z-normalization and/or padding, one series at a time.
+      opl = self.model.config.output_patch_len
       for i, c in enumerate(contexts):
         was_1d = np.ndim(c) == 1
-        tgt = np.atleast_2d(np.asarray(c, dtype=np.float32))  # (u, ctx)
-        ctx_len = tgt.shape[-1]
+        tgt_orig = np.atleast_2d(np.asarray(c, dtype=np.float32))  # (u, ctx)
+        tgt = tgt_orig
         po = po_list[i]
         pf = pf_list[i]
         po = np.atleast_2d(np.asarray(po, dtype=np.float32)) if po is not None else None
         pf = np.atleast_2d(np.asarray(pf, dtype=np.float32)) if pf is not None else None
+
+        # z-normalize on the full series (as torch does, before truncation): each
+        # target and covariate row by its own stats. Only target stats are kept,
+        # to un-normalize the target forecasts afterwards.
+        tgt_stats = None
+        if use_znorm:
+          tgt, tgt_stats = _znorm_rows(tgt)
+          if po is not None:
+            po, _ = _znorm_rows(po)
+          if pf is not None:
+            pf, _ = _znorm_rows(pf)
+
         # global_context truncation, keeping covariate windows aligned with the
         # target window (as the torch Query.format does).
+        ctx_len = tgt.shape[-1]
         if ctx_len > cap:
           tgt = tgt[:, -cap:]
           if po is not None:
@@ -276,9 +314,25 @@ class TimesFM3Forecaster:
           if pf is not None:
             future_len = pf.shape[-1] - ctx_len
             pf = pf[:, -(cap + future_len) :]
-          ctx_len = cap
-        final = _series_logits(tgt, po, pf)  # (num_variates, h, q)
-        forecast, quantiles = _shape(final, tgt.shape[0], was_1d, tgt)
+
+        # padding_mode="edge": extend the past-future covariate to the
+        # patch-rounded horizon (global_horizon) by repeating its last value, so
+        # the model sees a covariate for every decoded step. The output is still
+        # trimmed back to the requested horizon below.
+        if padding_mode == "edge" and pf is not None:
+          global_horizon = math.ceil(horizon / opl) * opl
+          pad_len = global_horizon - horizon
+          if pad_len > 0:
+            pf = np.pad(pf, [(0, 0), (0, pad_len)], mode="edge")
+
+        final = _series_logits(tgt, po, pf)  # (num_variates, decoded_h, q)
+        final = final[:, :horizon, :]  # trim edge-padded horizon back to requested
+        if use_znorm:
+          for r in range(tgt.shape[0]):
+            mu, sigma = tgt_stats[r]
+            final[r] = final[r] * sigma + mu
+
+        forecast, quantiles = _shape(final, tgt.shape[0], was_1d, tgt_orig)
         results[i] = ForecastOutput(
           ts_id=ids[i], forecast=forecast, quantiles=quantiles
         )

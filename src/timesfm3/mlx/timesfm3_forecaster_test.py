@@ -316,6 +316,55 @@ class TimesFM3MlxCovariateParityTest(unittest.TestCase):
       self.mlx.predict(target, **kw), self.torch.predict(target, **kw)
     )
 
+  def test_parity_znorm(self):
+    # Per-series z-normalization: normalize the input, forecast, un-normalize.
+    # Use a nonzero mean and scale so normalization actually does something.
+    ctx = (5.0 + 3.0 * np.sin(np.linspace(0, 40, 512))).astype(np.float32)
+    kw = dict(horizon=64, return_quantiles=True, use_znorm=True)
+    self._assert_parity(self.mlx.predict(ctx, **kw), self.torch.predict(ctx, **kw))
+
+  def test_parity_znorm_with_covariates(self):
+    rng = np.random.RandomState(3)
+    ctx_len, horizon = 256, 32
+    target = np.stack(
+      [
+        10.0 + 2.0 * np.sin(np.linspace(0, 24, ctx_len)),
+        -4.0 + np.cos(np.linspace(1, 26, ctx_len)),
+      ]
+    ).astype(np.float32)
+    past_only = (3.0 + 0.5 * rng.randn(1, ctx_len)).astype(np.float32)
+    past_future = (7.0 + np.sin(np.linspace(0, 30, ctx_len + horizon)))[None, :].astype(
+      np.float32
+    )
+    kw = dict(
+      horizon=horizon,
+      past_only_covariates=past_only,
+      past_future_covariates=past_future,
+      return_quantiles=True,
+      use_znorm=True,
+    )
+    self._assert_parity(
+      self.mlx.predict(target, **kw), self.torch.predict(target, **kw)
+    )
+
+  def test_parity_padding_mode_edge(self):
+    # horizon 32 is not a multiple of output_patch_length (64), so global_horizon
+    # is 64 and the past-future covariate is edge-padded out to it.
+    ctx_len, horizon = 256, 32
+    ctx = np.sin(np.linspace(0, 24, ctx_len)).astype(np.float32)
+    past_future = np.sin(np.linspace(0, 30, ctx_len + horizon))[None, :].astype(
+      np.float32
+    )
+    kw = dict(
+      horizon=horizon,
+      past_future_covariates=past_future,
+      return_quantiles=True,
+      padding_mode="edge",
+    )
+    mlx_out = self.mlx.predict(ctx, **kw)
+    self.assertEqual(np.asarray(mlx_out.forecast).shape, (horizon,))
+    self._assert_parity(mlx_out, self.torch.predict(ctx, **kw))
+
 
 if __name__ == "__main__":
   unittest.main()
